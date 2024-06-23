@@ -1,31 +1,140 @@
 global start
+extern long_mode_start
 
 section .text   
 bits 32
 
 start:
-    ;   print OK
-    ; sending memory-mapped data to video-memory bus of addr [0xb8000] with data after the space
-    ; first letter for bg color, second for fg color; third + fourth for the character
-    mov word [0xb8000], 0x0243 ; "C" in green (0x02) on black background (0x00)
-    mov word [0xb8002], 0x0248 ; "H" in green (0x02) on black background (0x00)
-    mov word [0xb8004], 0x0255 ; "U" in green (0x02) on black background (0x00)
-    mov word [0xb8006], 0x0250 ; "P" in green (0x02) on black background (0x00)
-    mov word [0xb8008], 0x0241 ; "A" in green (0x02) on black background (0x00)
-    mov word [0xb800a], 0x0243 ; "C" in green (0x02) on black background (0x00)
-    mov word [0xb800c], 0x0241 ; "A" in green (0x02) on black background (0x00)
-    mov word [0xb800e], 0x0242 ; "B" in green (0x02) on black background (0x00)
-    mov word [0xb8010], 0x0252 ; "R" in green (0x02) on black background (0x00)
-    mov word [0xb8012], 0x0241 ; "A" in green (0x02) on black background (0x00)
-    mov word [0xb8014], 0x0220 ; " " in green (0x02) on black background (0x00)
-    mov word [0xb8016], 0x0253 ; "S" in green (0x02) on black background (0x00)
-    mov word [0xb8018], 0x0241 ; "A" in green (0x02) on black background (0x00)
-    mov word [0xb801a], 0x0259 ; "Y" in green (0x02) on black background (0x00)
-    mov word [0xb801c], 0x0253 ; "S" in green (0x02) on black background (0x00)
-    mov word [0xb801e], 0x0220 ; " " in green (0x02) on black background (0x00)
-    mov word [0xb8020], 0x0248 ; "H" in green (0x02) on black background (0x00)
-    mov word [0xb8022], 0x0245 ; "E" in green (0x02) on black background (0x00)
-    mov word [0xb8024], 0x024C ; "L" in green (0x02) on black background (0x00)
-    mov word [0xb8026], 0x024C ; "L" in green (0x02) on black background (0x00)
-    mov word [0xb8028], 0x024F ; "O" in green (0x02) on black background (0x00)
-    hlt; 
+    mov esp, stack_top         ; set stack pointer to top
+    call check_multiboot
+    call check_cpuid
+    call check_long_mode
+
+    call setup_page_tables
+    call enable_paging
+
+    lgdt [gdt64.pointer]
+    jmp gdt64.code_segment:long_mode_start
+
+    hlt
+
+check_multiboot:
+    cmp eax, 0x36d76289     ; bootloader sets eax to 0x36d76289 indicating kernel was loaded by multiboot-compliant bootloader
+    jne .no_multiboot
+    ret
+.no_multiboot:
+    mov al, "M"
+    jmp error
+
+check_cpuid:
+    ; attempt to flip the cpuid bit of flag reg, if yes then cpuid available
+    pushfd
+    pop eax
+    mov ecx, eax
+    xor eax, 1 << 21
+    push eax
+    popfd
+    pushfd
+    pop eax
+    push ecx
+    popfd
+    cmp eax, ecx
+    je .no_cpuid
+    ret
+.no_cpuid:
+    mov al, "C"
+    jmp error
+
+check_long_mode:
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000001
+    jb .no_long_mode
+
+    mov eax, 0x80000001
+    cpuid
+    test edx, 1 << 29
+    jz .no_long_mode
+
+    ret
+.no_long_mode:
+    mov al, "L"
+    jmp error
+
+setup_page_tables:
+    mov eax, page_table_l3
+    or eax, 0b11    ; present, writable
+    mov [page_table_l4], eax
+
+    mov eax, page_table_l2
+    or eax, 0b11 ; present, writable
+    mov [page_table_l3], eax
+
+    mov ecx, 0  ; counter
+
+.loop:    
+    mov eax, 0x200000 ; 2MiB
+    mul ecx
+    or eax, 0b10000011  ; present, writable, huge page
+    mov [page_table_l2 + ecx * 8], eax
+
+    inc ecx
+    cmp ecx, 512 ; check if whole table is mapped
+    jne .loop
+
+    ret
+
+enable_paging:
+    ; pass page table location to cpu
+    mov eax, page_table_l4
+    mov cr3, eax
+
+    ; enable PAE - Physical Address extension (for 64-bit paging)
+    mov eax, cr4
+    or eax, 1<<5
+    mov cr4, eax
+
+    ; enable long mode
+    mov ecx, 0xC0000080
+    rdmsr       ; would load efer reg in eax
+    or eax, 1 << 8
+    wrmsr
+
+    ; enable paging
+    mov eax, cr0
+    or eax, 1 << 31
+    mov cr0, eax
+
+    ret
+
+error:
+    ; print "ERR X" where X is the error code
+    mov dword [0xb8000], 0x4f524f45
+    mov dword [0xb8004], 0x4f3a4f52
+    mov dword [0xb8008], 0x4f204f20
+    mov byte  [0xb800a], al
+    hlt
+
+section .bss
+align 4096
+
+page_table_l4:
+    resb 4096
+page_table_l3:
+    resb 4096
+page_table_l2:
+    resb 4096
+
+stack_bottom:
+    resb 4096*4                ; reserve 16kb stack space
+stack_top:
+
+
+section .rodata
+gdt64:
+    dq 0 ; zero entry
+.code_segment: equ $ - gdt64
+    dq (1 << 43) | (1 << 44) | (1 << 47) | (1 << 53); code segment
+.pointer:
+    dw $ - gdt64 -1 
+    dq gdt64
